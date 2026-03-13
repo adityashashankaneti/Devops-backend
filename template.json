@@ -1,0 +1,75 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Transform": "AWS::Serverless-2016-10-31",
+  "Description": "DevOps AI Backend — Lambda that generates Terraform from architecture JSON and pushes to infra-live repo",
+
+  "Globals": {
+    "Function": {
+      "Runtime": "python3.12",
+      "Timeout": 60,
+      "MemorySize": 512,
+      "Environment": {
+        "Variables": {
+          "GITHUB_REPO": "your-org/devops-infra-live",
+          "GITHUB_TOKEN_SECRET_ARN": "",
+          "ANTHROPIC_API_KEY_SECRET_ARN": ""
+        }
+      }
+    }
+  },
+
+  "Resources": {
+    "GenerateAndPushFunction": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "Handler": "handler.lambda_handler",
+        "CodeUri": "src/",
+        "Description": "Receives architecture JSON, generates Terraform via Claude, pushes to infra-live repo",
+        "Policies": [
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "secretsmanager:GetSecretValue"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+        ],
+        "Events": {
+          "DeployApi": {
+            "Type": "HttpApi",
+            "Properties": {
+              "Path": "/api/deploy",
+              "Method": "POST"
+            }
+          },
+          "HealthCheck": {
+            "Type": "HttpApi",
+            "Properties": {
+              "Path": "/api/health",
+              "Method": "GET"
+            }
+          },
+          "StatusCheck": {
+            "Type": "HttpApi",
+            "Properties": {
+              "Path": "/api/status",
+              "Method": "GET"
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "Outputs": {
+    "ApiUrl": {
+      "Description": "API Gateway URL",
+      "Value": { "Fn::Sub": "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com" }
+    }
+  }
+}

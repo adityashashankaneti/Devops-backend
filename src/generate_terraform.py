@@ -1,0 +1,399 @@
+"""
+Generate per-resource-type YAML configs from the architecture JSON payload using Claude.
+
+Instead of generating raw Terraform code, Claude now classifies each canvas
+resource by module type and emits a YAML config dict.  The Python code then
+writes the YAML into per-resource-type directories alongside pre-built
+Terragrunt configs that point at reusable Terraform modules.
+
+Returns:
+    dict[str, dict] — { module_type: { resource_name: { config } } }
+    e.g. {"vpc": {"my-vpc": {"cidr_block": "10.0.0.0/16"}}}
+"""
+
+import json
+import logging
+import yaml
+
+logger = logging.getLogger(__name__)
+
+# ── Resource-type mapping ────────────────────────────────────────────────────
+# Maps frontend resource IDs → Terraform module directory names.
+RESOURCE_TYPE_MAP: dict[str, str] = {
+    "vpc":                "vpc",
+    "subnet-public":      "subnet",
+    "subnet-private":     "subnet",
+    "availability-zone":  None,        # placement concept, not a real TF resource
+    "nat-gateway":        "nat-gateway",
+    "internet-gateway":   "internet-gateway",
+    "route53":            "route53",
+    "elastic-ip":         None,        # handled inside nat-gateway module
+    "transit-gateway":    None,
+    "direct-connect":     None,
+    "vpc-peering":        None,
+    "ec2":                "ec2",
+    "lambda":             "lambda",
+    "ecs":                "ecs",
+    "eks":                None,
+    "fargate":            "ecs",
+    "auto-scaling":       None,
+    "batch":              None,
+    "s3":                 "s3",
+    "ebs":                None,        # handled as ec2 root_block_device
+    "efs":                None,
+    "glacier":            None,
+    "fsx":                None,
+    "rds":                "rds",
+    "dynamodb":           "dynamodb",
+    "elasticache":        "elasticache",
+    "aurora":             "rds",
+    "redshift":           None,
+    "documentdb":         None,
+    "alb":                "alb",
+    "nlb":                "alb",
+    "api-gateway":        None,
+    "global-accelerator": None,
+    "iam":                None,
+    "waf":                None,
+    "shield":             None,
+    "kms":                None,
+    "secrets-manager":    None,
+    "security-group":     "security-group",
+    "acm":                None,
+    "cloudwatch":         None,
+    "cloudtrail":         None,
+    "config":             None,
+    "xray":               None,
+    "cloudfront":         "cloudfront",
+    "sqs":                "sqs",
+    "sns":                "sns",
+    "eventbridge":        "eventbridge",
+    "kinesis":            None,
+    "codepipeline":       None,
+    "codebuild":          None,
+    "codedeploy":         None,
+    "ecr":                None,
+    "terraform":          None,
+    "route-table":        "route-table",
+}
+
+# Module types we have pre-built Terraform modules for
+SUPPORTED_MODULES = {v for v in RESOURCE_TYPE_MAP.values() if v is not None}
+
+# ── Claude prompt ────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are an expert AWS infrastructure engineer.  You receive a canvas-designed
+architecture (nested JSON) and your job is to CLASSIFY each resource by its
+Terraform module type and produce a YAML-friendly configuration dict.
+
+You do NOT generate Terraform or HCL code.  You produce a JSON object where:
+- Top-level keys are module types (vpc, subnet, ec2, security-group, s3, rds,
+  lambda, alb, eventbridge, sqs, sns, dynamodb, route53, ecs, cloudfront,
+  elasticache, internet-gateway, nat-gateway, route-table).
+- Under each module type is a map of   resource_name → config_object.
+- Config objects use snake_case keys matching the Terraform module variables.
+
+Cross-reference rules (use NAME references, not IDs):
+- Subnets:         add "vpc_name" pointing to the parent VPC's resource name
+- EC2 instances:   add "subnet_name" + "security_groups" (list of SG names)
+- Security groups: add "vpc_name"
+- RDS:             add "subnet_names" (list) + "security_groups" (list)
+- ALB/NLB:         add "vpc_name" + "subnet_names" (list) + "security_groups"
+- Internet GW:     add "vpc_name"
+- NAT GW:          add "subnet_name" (public subnet)
+- Lambda (in VPC): add "subnet_names" + "security_groups"
+
+Route Table rules (ALWAYS generate these when subnets exist):
+- For every PUBLIC subnet:  create a route table in the "route-table" module with:
+    vpc_name, routes: [{cidr_block: "0.0.0.0/0", gateway_type: "igw", gateway_name: <igw-name>}]
+    subnet_associations: [<public-subnet-name>, ...]
+- For every PRIVATE subnet: create a route table with:
+    vpc_name, routes: [{cidr_block: "0.0.0.0/0", gateway_type: "nat", gateway_name: <nat-gw-name>}]
+    subnet_associations: [<private-subnet-name>, ...]
+- Auto-create an internet-gateway if public subnets exist but none is on the canvas.
+- Auto-create a nat-gateway (in a public subnet) if private subnets exist but none is on the canvas.
+
+Property mapping from canvas → module config:
+- cidrBlock      → cidr_block
+- instanceType   → instance_type
+- amiId / ami    → ami
+- multiAZ        → multi_az
+- dnsHostnames   → enable_dns_hostnames
+- publicIp       → map_public_ip_on_launch  /  associate_public_ip_address
+- engine         → engine
+- engineVersion  → engine_version
+- dbName         → db_name
+- allocatedStorage → allocated_storage
+- name           → (becomes the resource key, not a property)
+
+For NLB, set type: "network" in the config (ALB defaults to "application").
+
+════════════════════════════════════════════════════════════════════════════════
+CONNECTION-BASED ACCESS POLICIES (CRITICAL)
+════════════════════════════════════════════════════════════════════════════════
+
+Every connection (source → target) on the canvas represents a real dependency.
+You MUST generate the appropriate access policies:
+
+1. SECURITY GROUP RULES (network-level)
+   Add ingress_rules[] to the TARGET resource's security group config.
+   Each rule needs: from_port, to_port, protocol, and EITHER
+     - cidr_blocks (for CIDR-based access)
+     - source_security_group (SG name, for SG-to-SG access)
+
+   Connection rules:
+   - EC2/ECS → RDS (MySQL/Aurora):     port 3306, tcp, source_security_group = source's SG
+   - EC2/ECS → RDS (PostgreSQL):       port 5432, tcp, source_security_group = source's SG
+   - EC2/ECS → ElastiCache (Redis):    port 6379, tcp, source_security_group = source's SG
+   - EC2/ECS → ElastiCache (Memcached): port 11211, tcp, source_security_group = source's SG
+   - ALB → EC2/ECS:                    port 80+443, tcp, source_security_group = ALB's SG
+   - Public → ALB:                     port 443, tcp, cidr_blocks = ["0.0.0.0/0"]
+   - Lambda → RDS/ElastiCache:         same port rules, source_security_group = Lambda's SG
+
+   If a resource doesn't already have a security group, CREATE one in the
+   security-group module type (e.g. "web-server-sg") and reference it.
+
+2. IAM POLICIES (identity-based, least-privilege)
+   Add iam_policies[] to Lambda/ECS configs.  Each policy needs:
+     - sid: unique identifier (e.g. "DynamoDBAccess")
+     - actions: list of specific IAM actions (NEVER use wildcards like *)
+     - resources: list of ARN patterns
+
+   Connection rules (source → target):
+   - Lambda/ECS → DynamoDB:
+       actions: ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:UpdateItem",
+                 "dynamodb:DeleteItem","dynamodb:Query","dynamodb:Scan"]
+       resources: ["arn:aws:dynamodb:*:*:table/<table-name>",
+                   "arn:aws:dynamodb:*:*:table/<table-name>/index/*"]
+   - Lambda/ECS → S3:
+       actions: ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"]
+       resources: ["arn:aws:s3:::<bucket-name>","arn:aws:s3:::<bucket-name>/*"]
+   - Lambda/ECS → SQS:
+       actions: ["sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage",
+                 "sqs:GetQueueAttributes"]
+       resources: ["arn:aws:sqs:*:*:<queue-name>"]
+   - Lambda/ECS → SNS:
+       actions: ["sns:Publish"]
+       resources: ["arn:aws:sns:*:*:<topic-name>"]
+   - Lambda → RDS (via RDS Proxy/IAM auth):
+       actions: ["rds-db:connect"]
+       resources: ["arn:aws:rds-db:*:*:dbuser:*/<db-username>"]
+   - Lambda/ECS → EventBridge:
+       actions: ["events:PutEvents"]
+       resources: ["arn:aws:events:*:*:event-bus/<bus-name>"]
+
+3. RESOURCE-BASED POLICIES (on the target)
+   Add these only when the target service supports resource policies:
+
+   - CloudFront → S3:  add bucket_policy to the S3 resource:
+       bucket_policy:
+         statements:
+           - Sid: "AllowCloudFrontOAC"
+             Effect: "Allow"
+             Principal:
+               Service: "cloudfront.amazonaws.com"
+             Action: "s3:GetObject"
+             Resource: "arn:aws:s3:::<bucket-name>/*"
+
+   - SNS → SQS:  add queue_policy to the SQS resource:
+       queue_policy:
+         statements:
+           - Sid: "AllowSNSPublish"
+             Effect: "Allow"
+             Principal:
+               Service: "sns.amazonaws.com"
+             Action: "sqs:SendMessage"
+             Resource: "arn:aws:sqs:*:*:<queue-name>"
+
+   - EventBridge → SNS:  add topic_policy to the SNS resource:
+       topic_policy:
+         statements:
+           - Sid: "AllowEventBridge"
+             Effect: "Allow"
+             Principal:
+               Service: "events.amazonaws.com"
+             Action: "sns:Publish"
+             Resource: "arn:aws:sns:*:*:<topic-name>"
+
+════════════════════════════════════════════════════════════════════════════════
+
+IMPORTANT:
+- Respond with ONLY a JSON object.  No markdown fences, no explanation.
+- Every resource on the canvas that maps to a supported module type MUST appear.
+- Every CONNECTION must produce the appropriate access configs above.
+- Sanitize resource names to be DNS-safe (lowercase, hyphens, no spaces).
+- Provide sensible defaults for required fields the user didn't set
+  (e.g. ami → "ami-0c7217cdde317cfec" for us-east-1 Amazon Linux 2023).
+- NEVER use IAM wildcard actions (*).  Always specify exact actions.
+- Use the resource NAME (not canvas ID) in ARN patterns.
+"""
+
+
+def _build_prompt(payload: dict) -> str:
+    """Build the user prompt from the deploy payload."""
+    project = payload.get("project", "my-infra")
+    region = payload.get("region", "us-east-1")
+    resources = payload.get("resources", [])
+    connections = payload.get("connections", [])
+
+    supported = sorted(SUPPORTED_MODULES)
+
+    return f"""\
+Classify the following architecture canvas into per-module-type YAML configs.
+
+Project: {project}
+Region: {region}
+Supported module types: {', '.join(supported)}
+
+Resource hierarchy (nested = parent-child relationship):
+{json.dumps(resources, indent=2)}
+
+Connections between resources (source → target):
+{json.dumps(connections, indent=2)}
+
+Return ONLY a JSON object: {{ "module_type": {{ "resource-name": {{ config }} }} }}"""
+
+
+def generate_resource_yamls(
+    payload: dict,
+    anthropic_api_key: str,
+) -> dict[str, dict]:
+    """
+    Call Claude to classify canvas resources into per-module-type YAML configs.
+
+    Returns: dict[str, dict]
+        e.g. {
+            "vpc": {"my-vpc": {"cidr_block": "10.0.0.0/16"}},
+            "ec2": {"web-server": {"instance_type": "t3.micro", ...}}
+        }
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    user_prompt = _build_prompt(payload)
+
+    logger.info("Calling Claude to classify resources into YAML configs...")
+
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8192,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    response_text = message.content[0].text.strip()
+
+    # Strip markdown fences if Claude wrapped the response
+    if response_text.startswith("```"):
+        lines = response_text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        response_text = "\n".join(lines)
+
+    try:
+        resource_map = json.loads(response_text)
+    except json.JSONDecodeError as e:
+        logger.error("Claude returned invalid JSON: %s", response_text[:500])
+        raise ValueError(f"Failed to parse Claude response as JSON: {e}")
+
+    if not isinstance(resource_map, dict):
+        raise ValueError("Claude response must be a JSON object of module_type → resources")
+
+    # Validate module types
+    for module_type in list(resource_map.keys()):
+        if module_type not in SUPPORTED_MODULES:
+            logger.warning("Unsupported module type '%s' — skipping", module_type)
+            del resource_map[module_type]
+
+    total = sum(len(v) for v in resource_map.values())
+    logger.info(
+        "Classified %d resources across %d module types: %s",
+        total, len(resource_map), list(resource_map.keys()),
+    )
+    return resource_map
+
+
+# ── Terragrunt HCL templates ────────────────────────────────────────────────
+# Dependencies each module type needs from other modules' outputs.
+
+MODULE_DEPENDENCIES: dict[str, list[dict[str, str]]] = {
+    "vpc":              [],
+    "subnet":           [{"name": "vpc", "output": "vpc_ids"}],
+    "ec2":              [{"name": "subnet", "output": "subnet_ids"},
+                         {"name": "security-group", "output": "security_group_ids"}],
+    "security-group":   [{"name": "vpc", "output": "vpc_ids"}],
+    "s3":               [],
+    "rds":              [{"name": "subnet", "output": "subnet_ids"},
+                         {"name": "security-group", "output": "security_group_ids"}],
+    "lambda":           [{"name": "subnet", "output": "subnet_ids"},
+                         {"name": "security-group", "output": "security_group_ids"}],
+    "alb":              [{"name": "vpc", "output": "vpc_ids"},
+                         {"name": "subnet", "output": "subnet_ids"},
+                         {"name": "security-group", "output": "security_group_ids"}],
+    "internet-gateway": [{"name": "vpc", "output": "vpc_ids"}],
+    "nat-gateway":      [{"name": "subnet", "output": "subnet_ids"}],
+    "eventbridge":      [],
+    "sqs":              [],
+    "sns":              [],
+    "dynamodb":         [],
+    "route53":          [{"name": "vpc", "output": "vpc_ids"}],
+    "ecs":              [],
+    "cloudfront":       [],
+    "elasticache":      [{"name": "subnet", "output": "subnet_ids"},
+                         {"name": "security-group", "output": "security_group_ids"}],
+}
+
+
+def build_terragrunt_hcl(module_type: str, modules_in_deploy: set[str]) -> str:
+    """Generate a terragrunt.hcl for a given module type."""
+    deps = MODULE_DEPENDENCIES.get(module_type, [])
+    # Only include dependencies for modules that actually exist in this deploy
+    active_deps = [d for d in deps if d["name"] in modules_in_deploy]
+
+    lines = [
+        'include "root" {',
+        "  path = find_in_parent_folders()",
+        "}",
+        "",
+        "terraform {",
+        f'  source = "${{get_repo_root()}}/modules//{module_type}"',
+        "}",
+        "",
+        "locals {",
+        '  config = yamldecode(file("resources.yaml"))',
+        "}",
+        "",
+    ]
+
+    # Dependency blocks
+    for dep in active_deps:
+        lines += [
+            f'dependency "{dep["name"]}" {{',
+            f'  config_path = "../{dep["name"]}"',
+            "  mock_outputs = {",
+            f'    {dep["output"]} = {{}}',
+            "  }",
+            "}",
+            "",
+        ]
+
+    # Inputs
+    lines += ["inputs = {", "  resources = local.config", f'  project   = "{module_type}"']
+
+    for dep in active_deps:
+        lines.append(f'  {dep["output"]} = dependency.{dep["name"]}.outputs.{dep["output"]}')
+
+    lines += ["}"]
+
+    return "\n".join(lines) + "\n"
+
+
+def build_project_yaml(project: str, region: str) -> str:
+    """Generate the project.yaml config read by root terragrunt.hcl."""
+    return yaml.dump({"project": project, "region": region}, default_flow_style=False)
+
+
+def resources_to_yaml(resources: dict) -> str:
+    """Convert a resource config dict to YAML string."""
+    return yaml.dump(resources, default_flow_style=False, sort_keys=False)

@@ -1,0 +1,10 @@
+{
+  "requestContext": {
+    "http": {
+      "method": "POST"
+    }
+  },
+  "rawPath": "/api/deploy",
+  "isBase64Encoded": false,
+  "body": "{\"project\":\"my-infra\",\"region\":\"us-east-1\",\"resources\":[{\"id\":\"node_0\",\"resourceType\":\"vpc\",\"name\":\"My VPC\",\"properties\":{\"cidrBlock\":\"10.0.0.0/16\",\"dnsHostnames\":true,\"dnsResolution\":true},\"children\":[{\"id\":\"node_1\",\"resourceType\":\"subnet-public\",\"name\":\"Public Subnet\",\"properties\":{\"cidrBlock\":\"10.0.1.0/24\",\"availabilityZone\":\"us-east-1a\",\"autoAssignPublicIp\":true},\"children\":[{\"id\":\"node_2\",\"resourceType\":\"ec2\",\"name\":\"Web Server\",\"properties\":{\"instanceType\":\"t3.micro\",\"ami\":\"ami-0abcdef1234567890\"},\"children\":[]}]},{\"id\":\"node_3\",\"resourceType\":\"subnet-private\",\"name\":\"Private Subnet\",\"properties\":{\"cidrBlock\":\"10.0.10.0/24\",\"availabilityZone\":\"us-east-1b\"},\"children\":[{\"id\":\"node_4\",\"resourceType\":\"rds\",\"name\":\"Database\",\"properties\":{\"engine\":\"postgres\",\"instanceClass\":\"db.t3.micro\",\"storage\":20,\"multiAz\":true},\"children\":[]}]}]},{\"id\":\"node_5\",\"resourceType\":\"s3\",\"name\":\"Assets Bucket\",\"properties\":{\"bucketName\":\"my-infra-assets\",\"versioning\":true,\"encryption\":true},\"children\":[]}],\"connections\":[{\"id\":\"e_1\",\"connectorType\":\"default\",\"source\":{\"resourceId\":\"node_2\",\"resourceType\":\"ec2\",\"name\":\"Web Server\"},\"target\":{\"resourceId\":\"node_4\",\"resourceType\":\"rds\",\"name\":\"Database\"}},{\"id\":\"e_2\",\"connectorType\":\"default\",\"source\":{\"resourceId\":\"node_2\",\"resourceType\":\"ec2\",\"name\":\"Web Server\"},\"target\":{\"resourceId\":\"node_5\",\"resourceType\":\"s3\",\"name\":\"Assets Bucket\"}}]}"
+}

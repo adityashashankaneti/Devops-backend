@@ -1,0 +1,170 @@
+"""
+DevOps AI Backend — Lambda Handler
+
+Flow:
+  1. Receive architecture JSON from frontend
+  2. Send to Claude to classify resources into per-module-type YAML configs
+  3. Push YAML files (merge/append) to devops-infra-live repo on feature branch
+  4. Return branch URL + PR URL + commit SHA to frontend
+
+Endpoints:
+  POST /api/deploy   — Run the full deploy pipeline
+  GET  /api/status    — Poll CI/CD status of a PR (query param: pr_url)
+  GET  /api/health    — Health check
+"""
+
+import json
+import os
+import logging
+from generate_terraform import (
+    generate_resource_yamls,
+    build_terragrunt_hcl,
+    build_project_yaml,
+    resources_to_yaml,
+)
+from git_push import push_to_infra_repo, get_pr_status
+from secrets_helper import get_secret
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+def lambda_handler(event, context):
+    """AWS Lambda entry point."""
+
+    path = event.get("rawPath", "") or event.get("path", "")
+    method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+
+    # Health check
+    if path.endswith("/health") and method == "GET":
+        return _response(200, {"status": "ok"})
+
+    # Status polling
+    if path.endswith("/status") and method == "GET":
+        return _handle_status(event)
+
+    # Deploy — only POST
+    if path.endswith("/deploy") and method == "POST":
+        return _handle_deploy(event)
+
+    return _response(405, {"error": "Method not allowed"})
+
+
+def _handle_deploy(event):
+    """Handle POST /api/deploy — full pipeline."""
+
+    body = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        import base64
+        body = base64.b64decode(body).decode("utf-8")
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return _response(400, {"error": "Invalid JSON body"})
+
+    if not payload.get("resources"):
+        return _response(400, {"error": "No resources in payload"})
+
+    project = payload.get("project", "my-infra")
+    region = payload.get("region", "us-east-1")
+    resources = payload.get("resources", [])
+    connections = payload.get("connections", [])
+
+    logger.info(
+        "Deploy request: project=%s region=%s resources=%d connections=%d",
+        project, region, len(resources), len(connections),
+    )
+
+    try:
+        # Step 1: Call Claude to classify resources into per-module YAML
+        anthropic_key = get_secret(
+            os.environ.get("ANTHROPIC_API_KEY_SECRET_ARN", ""),
+            fallback_env="ANTHROPIC_API_KEY",
+        )
+        resource_map = generate_resource_yamls(
+            payload=payload,
+            anthropic_api_key=anthropic_key,
+        )
+
+        # Step 2: Build project.yaml
+        project_yaml = build_project_yaml(project, region)
+
+        # Step 3: Push to infra-live repo (YAML merge/append into environments/dev/)
+        github_token = get_secret(
+            os.environ.get("GITHUB_TOKEN_SECRET_ARN", ""),
+            fallback_env="GITHUB_TOKEN",
+        )
+        repo_name = os.environ.get("GITHUB_REPO", "your-org/devops-infra-live")
+        branch_name = f"feature/{project}"
+
+        modules_in_deploy = set(resource_map.keys())
+
+        result = push_to_infra_repo(
+            github_token=github_token,
+            repo_name=repo_name,
+            branch_name=branch_name,
+            project=project,
+            region=region,
+            resource_map=resource_map,
+            terragrunt_hcls={},
+            project_yaml=project_yaml,
+            commit_message=f"feat: deploy {project} ({region})",
+        )
+
+        return _response(200, {
+            "status": "success",
+            "branch": result["branch"],
+            "commit_sha": result["commit_sha"],
+            "pr_url": result.get("pr_url"),
+            "files_written": result.get("files_written", []),
+            "module_types": sorted(modules_in_deploy),
+            "resource_count": sum(len(v) for v in resource_map.values()),
+        })
+
+    except Exception as e:
+        logger.exception("Deploy failed")
+        return _response(500, {"error": str(e)})
+
+
+def _handle_status(event):
+    """Handle GET /api/status — poll CI/CD status of a PR."""
+
+    # Get pr_url from query params
+    query = event.get("queryStringParameters") or {}
+    pr_url = query.get("pr_url", "")
+
+    if not pr_url:
+        return _response(400, {"error": "Missing required query param: pr_url"})
+
+    try:
+        github_token = get_secret(
+            os.environ.get("GITHUB_TOKEN_SECRET_ARN", ""),
+            fallback_env="GITHUB_TOKEN",
+        )
+        repo_name = os.environ.get("GITHUB_REPO", "your-org/devops-infra-live")
+
+        status = get_pr_status(
+            github_token=github_token,
+            repo_name=repo_name,
+            pr_url=pr_url,
+        )
+
+        return _response(200, {"status": "ok", **status})
+
+    except Exception as e:
+        logger.exception("Status check failed")
+        return _response(500, {"error": str(e)})
+
+
+def _response(status_code: int, body: dict) -> dict:
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        },
+        "body": json.dumps(body),
+    }
