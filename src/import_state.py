@@ -355,6 +355,9 @@ def import_from_state(project: str, region: str) -> dict:
         }
         nodes.append(node)
 
+    from collections import Counter
+    tf_type_counts = dict(Counter(r["tf_type"] for r in all_resources))
+
     return {
         "nodes": nodes,
         "edges": [],
@@ -362,4 +365,6 @@ def import_from_state(project: str, region: str) -> dict:
         "project": project,
         "region": region,
         "state_files_read": len(state_keys),
+        "state_files": state_keys,
+        "tf_types_found": tf_type_counts,
     }
