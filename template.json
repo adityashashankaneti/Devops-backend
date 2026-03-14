@@ -19,6 +19,18 @@
   },
 
   "Resources": {
+    "DevOpsHttpApi": {
+      "Type": "AWS::Serverless::HttpApi",
+      "Properties": {
+        "CorsConfiguration": {
+          "AllowOrigins": ["*"],
+          "AllowMethods": ["GET", "POST", "OPTIONS"],
+          "AllowHeaders": ["Content-Type", "Authorization"],
+          "MaxAge": 300
+        }
+      }
+    },
+
     "GenerateAndPushFunction": {
       "Type": "AWS::Serverless::Function",
       "Properties": {
@@ -43,6 +55,7 @@
           "DeployApi": {
             "Type": "HttpApi",
             "Properties": {
+              "ApiId": { "Ref": "DevOpsHttpApi" },
               "Path": "/api/deploy",
               "Method": "POST"
             }
@@ -50,6 +63,7 @@
           "HealthCheck": {
             "Type": "HttpApi",
             "Properties": {
+              "ApiId": { "Ref": "DevOpsHttpApi" },
               "Path": "/api/health",
               "Method": "GET"
             }
@@ -57,6 +71,7 @@
           "StatusCheck": {
             "Type": "HttpApi",
             "Properties": {
+              "ApiId": { "Ref": "DevOpsHttpApi" },
               "Path": "/api/status",
               "Method": "GET"
             }
@@ -64,6 +79,7 @@
           "ChatApi": {
             "Type": "HttpApi",
             "Properties": {
+              "ApiId": { "Ref": "DevOpsHttpApi" },
               "Path": "/api/chat",
               "Method": "POST"
             }
@@ -76,7 +92,7 @@
   "Outputs": {
     "ApiUrl": {
       "Description": "API Gateway URL",
-      "Value": { "Fn::Sub": "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com" }
+      "Value": { "Fn::Sub": "https://${DevOpsHttpApi}.execute-api.${AWS::Region}.amazonaws.com" }
     }
   }
 }
