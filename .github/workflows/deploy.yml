@@ -45,7 +45,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: SAM Validate
-        run: sam validate --template-file template.json
+        run: sam validate --template-file template.json --region ${{ env.AWS_REGION }}
 
       - name: SAM Build
         run: sam build --template-file template.json
