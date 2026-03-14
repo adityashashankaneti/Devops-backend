@@ -10,8 +10,8 @@
       "MemorySize": 512,
       "Environment": {
         "Variables": {
-          "GITHUB_REPO": "your-org/devops-infra-live",
-          "GITHUB_TOKEN_SECRET_ARN": "",
+          "GITHUB_REPO": "adityashashankaneti/devops-infra-live",
+          "GITHUB_TOKEN_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:978184426471:secret:devops-ai/github-token-HZQPMo",
           "ANTHROPIC_API_KEY_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:978184426471:secret:devops-ai/anthropic-api-key-DF5uC8"
         }
       }
