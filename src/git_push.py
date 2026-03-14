@@ -46,20 +46,50 @@ def _upsert_file(repo, path: str, content: str, message: str, branch: str):
         logger.info("Created: %s", path)
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """
+    Recursively merge override into base.
+
+    - Dicts are merged recursively.
+    - Lists are concatenated and deduplicated (by converting each item to a
+      canonical string key so that identical policy/rule entries aren't doubled).
+    - Scalar values in override replace those in base.
+    """
+    result = dict(base)
+    for key, val in override.items():
+        if key in result:
+            if isinstance(result[key], dict) and isinstance(val, dict):
+                result[key] = _deep_merge(result[key], val)
+            elif isinstance(result[key], list) and isinstance(val, list):
+                # Concatenate; deduplicate by stable string representation
+                seen = {str(item) for item in result[key]}
+                extras = [item for item in val if str(item) not in seen]
+                result[key] = result[key] + extras
+            else:
+                result[key] = val
+        else:
+            result[key] = val
+    return result
+
+
 def _merge_yaml_resources(existing_yaml: str | None, new_resources: dict) -> str:
     """
     Merge new resources into an existing YAML file.
 
-    If the file already has a resource with the same key, the new config
-    overwrites it (update).  New keys are appended.
+    If the file already has a resource with the same key, the configs are
+    deep-merged so that list fields (iam_policies, ingress_rules, etc.) are
+    appended rather than overwritten.  New keys are added.
     """
-    if existing_yaml:
-        existing = yaml.safe_load(existing_yaml) or {}
-    else:
-        existing = {}
+    existing = yaml.safe_load(existing_yaml) or {} if existing_yaml else {}
 
-    existing.update(new_resources)
-    return yaml.dump(existing, default_flow_style=False, sort_keys=False)
+    merged = dict(existing)
+    for name, config in new_resources.items():
+        if name in merged and isinstance(merged[name], dict) and isinstance(config, dict):
+            merged[name] = _deep_merge(merged[name], config)
+        else:
+            merged[name] = config
+
+    return yaml.dump(merged, default_flow_style=False, sort_keys=False)
 
 
 def push_to_infra_repo(

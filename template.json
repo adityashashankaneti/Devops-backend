@@ -12,7 +12,7 @@
         "Variables": {
           "GITHUB_REPO": "your-org/devops-infra-live",
           "GITHUB_TOKEN_SECRET_ARN": "",
-          "ANTHROPIC_API_KEY_SECRET_ARN": ""
+          "ANTHROPIC_API_KEY_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:978184426471:secret:devops-ai/anthropic-api-key-DF5uC8"
         }
       }
     }
@@ -59,6 +59,13 @@
             "Properties": {
               "Path": "/api/status",
               "Method": "GET"
+            }
+          },
+          "ChatApi": {
+            "Type": "HttpApi",
+            "Properties": {
+              "Path": "/api/chat",
+              "Method": "POST"
             }
           }
         }

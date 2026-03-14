@@ -60,6 +60,24 @@ sam deploy --guided
 
 After deployment, set `VITE_DEPLOY_URL` in the frontend to the API Gateway URL.
 
+### GitHub Actions Deployment
+
+This repo includes [deploy.yml](/C:/Users/Aditya%20Shashank/Documents/Devops-repos/Devops-backend/.github/workflows/deploy.yml), which:
+
+- validates and builds the SAM app on pull requests to `main`
+- deploys the Lambda stack automatically on pushes to `main`
+- uses GitHub OIDC to assume an AWS role instead of long-lived AWS keys
+
+Required GitHub configuration:
+
+| Type | Name | Purpose |
+|---|---|---|
+| Secret | `AWS_ROLE_ARN` | IAM role ARN that GitHub Actions will assume |
+| Secret | `AWS_REGION` | AWS region for the SAM deploy |
+| Variable | `SAM_STACK_NAME` | CloudFormation stack name, defaults to `devops-backend` |
+
+The AWS role trusted by GitHub Actions must allow deploying CloudFormation, Lambda, API Gateway, IAM, and reading your referenced Secrets Manager values.
+
 ## Test Event
 
 ```json

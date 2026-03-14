@@ -99,7 +99,7 @@ Cross-reference rules (use NAME references, not IDs):
 - EC2 instances:   add "subnet_name" + "security_groups" (list of SG names)
 - Security groups: add "vpc_name"
 - RDS:             add "subnet_names" (list) + "security_groups" (list)
-- ALB/NLB:         add "vpc_name" + "subnet_names" (list) + "security_groups"
+- ALB/NLB:         add "vpc_name" + "subnet_names" (list) + "security_groups" + "instance_names" (list of EC2 resource names that are targets, derived from connections)
 - Internet GW:     add "vpc_name"
 - NAT GW:          add "subnet_name" (public subnet)
 - Lambda (in VPC): add "subnet_names" + "security_groups"
@@ -183,7 +183,28 @@ You MUST generate the appropriate access policies:
        actions: ["events:PutEvents"]
        resources: ["arn:aws:events:*:*:event-bus/<bus-name>"]
 
-3. RESOURCE-BASED POLICIES (on the target)
+3. LAMBDA INVOCATION PERMISSIONS (inbound triggers)
+   When another service points TO a Lambda, add invoke_permissions[] on the Lambda config.
+   Each entry needs: statement_id (unique string), source_service (the principal), source_arn (optional).
+
+   Connection rules (source → Lambda):
+   - EventBridge → Lambda:
+       invoke_permissions:
+         - statement_id: "AllowEventBridgeInvoke"
+           source_service: "events.amazonaws.com"
+           source_arn: "arn:aws:events:<region>:<account>:rule/<rule-name>"
+   - SNS → Lambda:
+       invoke_permissions:
+         - statement_id: "AllowSNSInvoke"
+           source_service: "sns.amazonaws.com"
+           source_arn: "arn:aws:sns:*:*:<topic-name>"
+   - API Gateway → Lambda:
+       invoke_permissions:
+         - statement_id: "AllowAPIGatewayInvoke"
+           source_service: "apigateway.amazonaws.com"
+   Use * for account/region fields that aren't known at design time.
+
+4. RESOURCE-BASED POLICIES (on the target)
    Add these only when the target service supports resource policies:
 
    - CloudFront → S3:  add bucket_policy to the S3 resource:
@@ -258,6 +279,7 @@ Return ONLY a JSON object: {{ "module_type": {{ "resource-name": {{ config }} }}
 def generate_resource_yamls(
     payload: dict,
     anthropic_api_key: str,
+    model: str = "claude-sonnet-4-6",
 ) -> dict[str, dict]:
     """
     Call Claude to classify canvas resources into per-module-type YAML configs.
@@ -274,10 +296,10 @@ def generate_resource_yamls(
 
     user_prompt = _build_prompt(payload)
 
-    logger.info("Calling Claude to classify resources into YAML configs...")
+    logger.info("Calling Claude (%s) to classify resources into YAML configs...", model)
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=model,
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
@@ -330,7 +352,8 @@ MODULE_DEPENDENCIES: dict[str, list[dict[str, str]]] = {
                          {"name": "security-group", "output": "security_group_ids"}],
     "alb":              [{"name": "vpc", "output": "vpc_ids"},
                          {"name": "subnet", "output": "subnet_ids"},
-                         {"name": "security-group", "output": "security_group_ids"}],
+                         {"name": "security-group", "output": "security_group_ids"},
+                         {"name": "ec2", "output": "instance_ids"}],
     "internet-gateway": [{"name": "vpc", "output": "vpc_ids"}],
     "nat-gateway":      [{"name": "subnet", "output": "subnet_ids"}],
     "eventbridge":      [],

@@ -15,6 +15,7 @@ Endpoints:
 
 import json
 import os
+import re
 import logging
 from generate_terraform import (
     generate_resource_yamls,
@@ -43,11 +44,71 @@ def lambda_handler(event, context):
     if path.endswith("/status") and method == "GET":
         return _handle_status(event)
 
+    # Chat — only POST
+    if path.endswith("/chat") and method == "POST":
+        return _handle_chat(event)
+
     # Deploy — only POST
     if path.endswith("/deploy") and method == "POST":
         return _handle_deploy(event)
 
     return _response(405, {"error": "Method not allowed"})
+
+
+def _handle_chat(event):
+    """Handle POST /api/chat — send messages to Claude and return response."""
+
+    body = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        import base64
+        body = base64.b64decode(body).decode("utf-8")
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return _response(400, {"error": "Invalid JSON body"})
+
+    messages = payload.get("messages", [])
+    if not messages:
+        return _response(400, {"error": "No messages provided"})
+
+    # Validate message format
+    for msg in messages:
+        if msg.get("role") not in ("user", "assistant") or not msg.get("content"):
+            return _response(400, {"error": "Invalid message format"})
+
+    try:
+        import anthropic
+
+        anthropic_key = get_secret(
+            os.environ.get("ANTHROPIC_API_KEY_SECRET_ARN", ""),
+            fallback_env="ANTHROPIC_API_KEY",
+        )
+
+        client = anthropic.Anthropic(api_key=anthropic_key)
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=(
+                "You are a DevOps and AWS cloud architecture expert assistant. "
+                "Help users design cloud infrastructure, answer AWS service questions, "
+                "explain DevOps practices, and give actionable architecture advice. "
+                "Be concise and practical. Use markdown formatting where helpful."
+            ),
+            messages=messages,
+        )
+
+        reply = response.content[0].text
+
+        logger.info("Chat response: input_tokens=%d output_tokens=%d",
+                    response.usage.input_tokens, response.usage.output_tokens)
+
+        return _response(200, {"reply": reply})
+
+    except Exception as e:
+        logger.exception("Chat failed")
+        return _response(500, {"error": str(e)})
 
 
 def _handle_deploy(event):
@@ -66,14 +127,19 @@ def _handle_deploy(event):
     if not payload.get("resources"):
         return _response(400, {"error": "No resources in payload"})
 
-    project = payload.get("project", "my-infra")
+    project = re.sub(r'[^a-z0-9-]', '-', payload.get("project", "my-infra").lower())[:40].strip('-') or "my-infra"
     region = payload.get("region", "us-east-1")
     resources = payload.get("resources", [])
     connections = payload.get("connections", [])
 
+    ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+    model = payload.get("model", "claude-sonnet-4-6")
+    if model not in ALLOWED_MODELS:
+        model = "claude-sonnet-4-6"
+
     logger.info(
-        "Deploy request: project=%s region=%s resources=%d connections=%d",
-        project, region, len(resources), len(connections),
+        "Deploy request: project=%s region=%s resources=%d connections=%d model=%s",
+        project, region, len(resources), len(connections), model,
     )
 
     try:
@@ -85,6 +151,7 @@ def _handle_deploy(event):
         resource_map = generate_resource_yamls(
             payload=payload,
             anthropic_api_key=anthropic_key,
+            model=model,
         )
 
         # Step 2: Build project.yaml
