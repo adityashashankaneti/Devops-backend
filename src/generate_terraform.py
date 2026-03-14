@@ -276,7 +276,7 @@ EC2:
     sa-east-1:      "ami-037eba0eb03f95689"
 
 RDS:
-  engine          → "mysql"
+  engine          → "postgres"
   engine_version  → "8.0" (mysql) / "15.3" (postgres)
   instance_class  → "db.t3.micro"
   allocated_storage → 20
