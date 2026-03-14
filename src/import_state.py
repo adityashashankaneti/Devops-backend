@@ -224,7 +224,10 @@ def import_from_state(project: str, region: str) -> dict:
         return {"error": f"Could not get AWS account ID: {e}", "nodes": [], "edges": []}
 
     bucket = f"{project}-tf-state-{account_id}"
-    prefix = "environments/dev/"
+    # Terragrunt state key = path_relative_to_include()/terraform.tfstate
+    # Root hcl is at environments/terragrunt.hcl, child is at environments/dev/<type>/
+    # → relative path = dev/<type>  → S3 key = dev/<type>/terraform.tfstate
+    prefix = "dev/"
 
     try:
         state_keys = _list_state_files(s3, bucket, prefix)
