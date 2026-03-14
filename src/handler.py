@@ -24,6 +24,7 @@ from generate_terraform import (
     resources_to_yaml,
 )
 from git_push import push_to_infra_repo, get_pr_status
+from import_state import import_from_state
 from secrets_helper import get_secret
 
 logger = logging.getLogger()
@@ -51,6 +52,10 @@ def lambda_handler(event, context):
     # Deploy — only POST
     if path.endswith("/deploy") and method == "POST":
         return _handle_deploy(event)
+
+    # Import from Terraform state — only GET
+    if path.endswith("/import") and method == "GET":
+        return _handle_import(event)
 
     return _response(405, {"error": "Method not allowed"})
 
@@ -221,6 +226,31 @@ def _handle_status(event):
 
     except Exception as e:
         logger.exception("Status check failed")
+        return _response(500, {"error": str(e)})
+
+
+def _handle_import(event):
+    """Handle GET /api/import — read Terraform state from S3 and return canvas nodes."""
+
+    query = event.get("queryStringParameters") or {}
+    project = query.get("project", "").strip()
+    region  = query.get("region", "us-east-1").strip()
+
+    if not project:
+        return _response(400, {"error": "Missing required query param: project"})
+
+    import re
+    project = re.sub(r'[^a-z0-9-]', '-', project.lower())[:40].strip('-') or "my-infra"
+
+    logger.info("Import request: project=%s region=%s", project, region)
+
+    try:
+        result = import_from_state(project=project, region=region)
+        if "error" in result:
+            return _response(404, result)
+        return _response(200, result)
+    except Exception as e:
+        logger.exception("Import failed")
         return _response(500, {"error": str(e)})
 
 
