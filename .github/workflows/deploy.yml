@@ -41,9 +41,6 @@ jobs:
       - name: Setup SAM CLI
         uses: aws-actions/setup-sam@v2
 
-      - name: Install Python Dependencies
-        run: pip install -r requirements.txt
-
       - name: SAM Validate
         run: sam validate --template-file template.json --region ${{ env.AWS_REGION }}
 
@@ -74,9 +71,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: github-actions-devops-backend-deploy
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Install Python Dependencies
-        run: pip install -r requirements.txt
 
       - name: SAM Build
         run: sam build --template-file template.json
