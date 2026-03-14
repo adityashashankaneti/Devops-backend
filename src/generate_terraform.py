@@ -239,13 +239,85 @@ You MUST generate the appropriate access policies:
 
 ════════════════════════════════════════════════════════════════════════════════
 
+════════════════════════════════════════════════════════════════════════════════
+FILLING IN MISSING CONFIG (CRITICAL)
+════════════════════════════════════════════════════════════════════════════════
+
+When a resource has missing or empty properties you MUST supply sensible
+defaults. Do NOT leave required Terraform fields blank — that causes apply to
+fail. Use the parent VPC CIDR and region to derive appropriate values.
+
+VPC:
+  cidr_block → "10.0.0.0/16" (default)
+  enable_dns_hostnames → true
+  enable_dns_support   → true
+
+Subnet — derive CIDR from the parent VPC cidr_block automatically:
+  Public subnets:  10.x.1.0/24, 10.x.2.0/24, 10.x.3.0/24 …
+  Private subnets: 10.x.10.0/24, 10.x.11.0/24, 10.x.12.0/24 …
+  (where x = second octet of the VPC CIDR, e.g. VPC=10.0.0.0/16 → x=0)
+  availability_zone → cycle through the region's AZs (e.g. us-west-2a, us-west-2b, us-west-2c)
+  map_public_ip_on_launch → true for public, false for private
+
+EC2:
+  instance_type → "t3.micro"
+  ami (by region):
+    us-east-1:      "ami-0c7217cdde317cfec"
+    us-east-2:      "ami-05fb0b8c1424f266b"
+    us-west-1:      "ami-0ce2cb35386fc22e9"
+    us-west-2:      "ami-008fe2fc65df48dac"
+    ap-south-1:     "ami-0f5ee92e2d63afc18"
+    ap-southeast-1: "ami-0df7a207adb9748c7"
+    ap-southeast-2: "ami-0310483fb2b488153"
+    ap-northeast-1: "ami-0d52744d6551d851e"
+    eu-west-1:      "ami-0d71ea30463e0ff49"
+    eu-west-2:      "ami-0eb260c4d5475b901"
+    eu-central-1:   "ami-0faab6bdbac9486fb"
+    sa-east-1:      "ami-037eba0eb03f95689"
+
+RDS:
+  engine          → "mysql"
+  engine_version  → "8.0" (mysql) / "15.3" (postgres)
+  instance_class  → "db.t3.micro"
+  allocated_storage → 20
+  db_name         → resource name with hyphens replaced by underscores
+
+Lambda:
+  runtime      → "python3.12"
+  handler      → "index.handler"
+  memory_size  → 128
+  timeout      → 30
+
+ECS:
+  cpu          → 256
+  memory       → 512
+  container_port → 80
+
+ElastiCache:
+  node_type       → "cache.t3.micro"
+  engine          → "redis"
+  num_cache_nodes → 1
+
+DynamoDB:
+  billing_mode   → "PAY_PER_REQUEST"
+  hash_key       → "id"
+  hash_key_type  → "S"
+
+S3:
+  versioning          → false
+  public_access_block → true
+
+ALB:
+  internal → false (public-facing) / true (if only connected to private resources)
+
+════════════════════════════════════════════════════════════════════════════════
+
 IMPORTANT:
 - Respond with ONLY a JSON object.  No markdown fences, no explanation.
 - Every resource on the canvas that maps to a supported module type MUST appear.
 - Every CONNECTION must produce the appropriate access configs above.
 - Sanitize resource names to be DNS-safe (lowercase, hyphens, no spaces).
-- Provide sensible defaults for required fields the user didn't set
-  (e.g. ami → "ami-0c7217cdde317cfec" for us-east-1 Amazon Linux 2023).
+- Fill in ALL missing required fields using the defaults above — never leave them blank.
 - NEVER use IAM wildcard actions (*).  Always specify exact actions.
 - Use the resource NAME (not canvas ID) in ARN patterns.
 """
@@ -257,8 +329,16 @@ def _build_prompt(payload: dict) -> str:
     region = payload.get("region", "us-east-1")
     resources = payload.get("resources", [])
     connections = payload.get("connections", [])
+    existing = payload.get("existing_resources", [])
 
     supported = sorted(SUPPORTED_MODULES)
+
+    existing_section = ""
+    if existing:
+        existing_section = f"""
+Already-deployed resources (live in AWS — use their names/CIDRs as context when filling defaults):
+{json.dumps(existing, indent=2)}
+"""
 
     return f"""\
 Classify the following architecture canvas into per-module-type YAML configs.
@@ -266,7 +346,7 @@ Classify the following architecture canvas into per-module-type YAML configs.
 Project: {project}
 Region: {region}
 Supported module types: {', '.join(supported)}
-
+{existing_section}
 Resource hierarchy (nested = parent-child relationship):
 {json.dumps(resources, indent=2)}
 
