@@ -213,6 +213,93 @@ def push_to_infra_repo(
     }
 
 
+def push_destroy_to_main(
+    github_token: str,
+    repo_name: str,
+    project: str,
+    resource_type: str,
+    resource_name: str,
+    commit_message: str,
+    base_branch: str = "main",
+) -> dict:
+    """
+    Remove a named resource from resources.yaml and commit directly to main.
+    The push triggers the apply workflow which will run `terraform destroy` for it.
+
+    Returns: { commit_sha, resource_type, resource_name }
+    """
+    g = Github(github_token)
+    repo = g.get_repo(repo_name)
+
+    yaml_path = f"environments/dev/{resource_type}/resources.yaml"
+
+    # Read current file
+    try:
+        file_obj = repo.get_contents(yaml_path, ref=base_branch)
+        current_content = file_obj.decoded_content.decode("utf-8")
+        file_sha = file_obj.sha
+    except GithubException as e:
+        raise ValueError(f"Could not read {yaml_path}: {e}") from e
+
+    # Parse, remove the resource, write back
+    try:
+        data = yaml.safe_load(current_content) or {}
+    except yaml.YAMLError:
+        data = {}
+
+    if resource_name not in data:
+        raise ValueError(
+            f"Resource '{resource_name}' not found in {yaml_path}. "
+            "It may have already been destroyed."
+        )
+
+    del data[resource_name]
+    new_content = yaml.dump(data, default_flow_style=False, sort_keys=False) if data else "{}\n"
+
+    result = repo.update_file(
+        path=yaml_path,
+        message=commit_message,
+        content=new_content,
+        sha=file_sha,
+        branch=base_branch,
+    )
+    commit_sha = result["commit"].sha
+    logger.info("Destroy commit %s: removed %s/%s", commit_sha[:8], resource_type, resource_name)
+    return {"commit_sha": commit_sha, "resource_type": resource_type, "resource_name": resource_name}
+
+
+def get_commit_status(github_token: str, repo_name: str, commit_sha: str) -> dict:
+    """
+    Check GitHub Actions check runs for a specific commit SHA.
+    Used to poll the apply workflow triggered by a destroy commit on main.
+    """
+    g = Github(github_token)
+    repo = g.get_repo(repo_name)
+    commit = repo.get_commit(commit_sha)
+
+    checks = []
+    for run in commit.get_check_runs():
+        checks.append({
+            "name": run.name,
+            "status": run.status,
+            "conclusion": run.conclusion,
+            "details_url": run.details_url,
+        })
+
+    overall = "pending"
+    if checks:
+        conclusions = [c["conclusion"] for c in checks if c["conclusion"]]
+        actionable = [c for c in conclusions if c not in ("skipped", "neutral")]
+        if any(c in ("failure", "cancelled") for c in conclusions):
+            overall = "failure"
+        elif any(c["status"] == "in_progress" for c in checks):
+            overall = "in_progress"
+        elif len(conclusions) == len(checks) and all(c in ("success", "skipped", "neutral") for c in conclusions) and actionable:
+            overall = "success"
+
+    return {"overall_status": overall, "checks": checks, "commit_sha": commit_sha}
+
+
 def get_pr_status(github_token: str, repo_name: str, pr_url: str) -> dict:
     """
     Check the CI/CD status of a Pull Request.

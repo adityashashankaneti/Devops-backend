@@ -106,6 +106,22 @@
               "Path": "/api/import",
               "Method": "GET"
             }
+          },
+          "DestroyApi": {
+            "Type": "HttpApi",
+            "Properties": {
+              "ApiId": { "Ref": "DevOpsHttpApi" },
+              "Path": "/api/destroy",
+              "Method": "POST"
+            }
+          },
+          "CommitStatusApi": {
+            "Type": "HttpApi",
+            "Properties": {
+              "ApiId": { "Ref": "DevOpsHttpApi" },
+              "Path": "/api/commit-status",
+              "Method": "GET"
+            }
           }
         }
       }

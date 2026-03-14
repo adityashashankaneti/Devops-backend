@@ -23,7 +23,7 @@ from generate_terraform import (
     build_project_yaml,
     resources_to_yaml,
 )
-from git_push import push_to_infra_repo, get_pr_status
+from git_push import push_to_infra_repo, get_pr_status, push_destroy_to_main, get_commit_status
 from import_state import import_from_state
 from secrets_helper import get_secret
 
@@ -56,6 +56,14 @@ def lambda_handler(event, context):
     # Import from Terraform state — only GET
     if path.endswith("/import") and method == "GET":
         return _handle_import(event)
+
+    # Destroy a resource — only POST
+    if path.endswith("/destroy") and method == "POST":
+        return _handle_destroy(event)
+
+    # Poll commit status (for destroy apply tracking) — only GET
+    if path.endswith("/commit-status") and method == "GET":
+        return _handle_commit_status(event)
 
     return _response(405, {"error": "Method not allowed"})
 
@@ -226,6 +234,81 @@ def _handle_status(event):
 
     except Exception as e:
         logger.exception("Status check failed")
+        return _response(500, {"error": str(e)})
+
+
+def _handle_destroy(event):
+    """Handle POST /api/destroy — remove a resource from YAML and commit to main."""
+
+    body = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        import base64
+        body = base64.b64decode(body).decode("utf-8")
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return _response(400, {"error": "Invalid JSON body"})
+
+    project       = payload.get("project", "").strip()
+    region        = payload.get("region", "us-east-1").strip()
+    resource_type = payload.get("resource_type", "").strip()
+    resource_name = payload.get("resource_name", "").strip()
+
+    if not all([project, resource_type, resource_name]):
+        return _response(400, {"error": "Missing required fields: project, resource_type, resource_name"})
+
+    logger.info("Destroy request: project=%s type=%s name=%s", project, resource_type, resource_name)
+
+    try:
+        github_token = get_secret(
+            os.environ.get("GITHUB_TOKEN_SECRET_ARN", ""),
+            fallback_env="GITHUB_TOKEN",
+        )
+        repo_name = os.environ.get("GITHUB_REPO", "your-org/devops-infra-live")
+
+        result = push_destroy_to_main(
+            github_token=github_token,
+            repo_name=repo_name,
+            project=project,
+            resource_type=resource_type,
+            resource_name=resource_name,
+            commit_message=f"destroy: remove {resource_type}/{resource_name} from {project}",
+        )
+        return _response(200, {"status": "ok", **result})
+
+    except ValueError as e:
+        return _response(404, {"error": str(e)})
+    except Exception as e:
+        logger.exception("Destroy failed")
+        return _response(500, {"error": str(e)})
+
+
+def _handle_commit_status(event):
+    """Handle GET /api/commit-status?sha=... — poll check runs on a commit."""
+
+    query = event.get("queryStringParameters") or {}
+    commit_sha = query.get("sha", "").strip()
+
+    if not commit_sha:
+        return _response(400, {"error": "Missing required query param: sha"})
+
+    try:
+        github_token = get_secret(
+            os.environ.get("GITHUB_TOKEN_SECRET_ARN", ""),
+            fallback_env="GITHUB_TOKEN",
+        )
+        repo_name = os.environ.get("GITHUB_REPO", "your-org/devops-infra-live")
+
+        status = get_commit_status(
+            github_token=github_token,
+            repo_name=repo_name,
+            commit_sha=commit_sha,
+        )
+        return _response(200, status)
+
+    except Exception as e:
+        logger.exception("Commit status check failed")
         return _response(500, {"error": str(e)})
 
 
