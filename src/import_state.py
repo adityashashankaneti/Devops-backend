@@ -162,7 +162,7 @@ def _parse_state_file(s3: Any, bucket: str, key: str) -> list[dict]:
         name = res.get("name", "")
         for instance in res.get("instances", []):
             attrs = instance.get("attributes", {})
-            resources.append({"tf_type": tf_type, "name": name, "attrs": attrs})
+            resources.append({"tf_type": tf_type, "name": instance.get("index_key") or name, "attrs": attrs})
     return resources
 
 
