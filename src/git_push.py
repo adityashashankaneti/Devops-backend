@@ -241,15 +241,34 @@ def get_pr_status(github_token: str, repo_name: str, pr_url: str) -> dict:
             "details_url": run.details_url,
         })
 
+    # Also fetch check runs from the merge commit when the PR is merged,
+    # because apply jobs run on the merge commit (push to main), not pr.head.sha
+    merge_checks = []
+    if pr.merged and pr.merge_commit_sha:
+        try:
+            merge_commit = repo.get_commit(pr.merge_commit_sha)
+            for run in merge_commit.get_check_runs():
+                merge_checks.append({
+                    "name": run.name,
+                    "status": run.status,
+                    "conclusion": run.conclusion,
+                    "details_url": run.details_url,
+                })
+        except Exception:
+            pass
+
+    all_checks = checks + merge_checks
+
     overall = "pending"
-    if checks:
-        conclusions = [c["conclusion"] for c in checks if c["conclusion"]]
-        if all(c == "success" for c in conclusions) and len(conclusions) == len(checks):
-            overall = "success"
-        elif any(c == "failure" for c in conclusions):
+    if all_checks:
+        conclusions = [c["conclusion"] for c in all_checks if c["conclusion"]]
+        actionable = [c for c in conclusions if c not in ("skipped", "neutral")]
+        if any(c == "failure" or c == "cancelled" for c in conclusions):
             overall = "failure"
-        elif any(c["status"] == "in_progress" for c in checks):
+        elif any(c["status"] == "in_progress" for c in all_checks):
             overall = "in_progress"
+        elif len(conclusions) == len(all_checks) and all(c in ("success", "skipped", "neutral") for c in conclusions) and actionable:
+            overall = "success"
 
     return {
         "pr_number": pr_number,
@@ -257,5 +276,5 @@ def get_pr_status(github_token: str, repo_name: str, pr_url: str) -> dict:
         "pr_merged": pr.merged,
         "overall_status": overall,
         "combined_status": statuses.state,
-        "checks": checks,
+        "checks": all_checks,
     }
