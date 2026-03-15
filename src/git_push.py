@@ -147,10 +147,15 @@ def push_to_infra_repo(
     env_prefix = "environments/dev"
     files_written = []
 
-    # 1. Update project.yaml with project name + region
+    # 1. Write project.yaml only if it doesn't already exist on main.
+    #    Never overwrite it — the region/project are set once and shouldn't
+    #    change just because the user deployed with a different region selected.
     proj_path = f"{env_prefix}/project.yaml"
-    _upsert_file(repo, proj_path, project_yaml, commit_message, branch_name)
-    files_written.append(proj_path)
+    if _get_file_content(repo, proj_path, base_branch) is None:
+        _upsert_file(repo, proj_path, project_yaml, commit_message, branch_name)
+        files_written.append(proj_path)
+    else:
+        logger.info("Skipping project.yaml — already exists on %s", base_branch)
 
     # 2. For each resource type: only merge resources.yaml
     #    (terragrunt.hcl already exists as a static file in the repo)
