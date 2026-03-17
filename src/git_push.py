@@ -225,18 +225,20 @@ def push_destroy_to_main(
     resource_type: str,
     resource_name: str,
     commit_message: str,
+    env_dir: str = "dev",
     base_branch: str = "main",
 ) -> dict:
     """
     Remove a named resource from resources.yaml and commit directly to main.
-    The push triggers the apply workflow which will run `terraform destroy` for it.
+    Commit message starts with 'destroy:' so the regular apply workflow skips it.
+    The destroy.yml workflow_dispatch is then triggered separately.
 
     Returns: { commit_sha, resource_type, resource_name }
     """
     g = Github(github_token)
     repo = g.get_repo(repo_name)
 
-    yaml_path = f"environments/dev/{resource_type}/resources.yaml"
+    yaml_path = f"environments/{env_dir}/{resource_type}/resources.yaml"
 
     # Read current file
     try:
@@ -261,6 +263,10 @@ def push_destroy_to_main(
     del data[resource_name]
     new_content = yaml.dump(data, default_flow_style=False, sort_keys=False) if data else "{}\n"
 
+    # Ensure commit message starts with 'destroy:' so terraform.yml apply job is skipped
+    if not commit_message.startswith("destroy:"):
+        commit_message = f"destroy: {commit_message}"
+
     result = repo.update_file(
         path=yaml_path,
         message=commit_message,
@@ -270,6 +276,18 @@ def push_destroy_to_main(
     )
     commit_sha = result["commit"].sha
     logger.info("Destroy commit %s: removed %s/%s", commit_sha[:8], resource_type, resource_name)
+
+    # Trigger the dedicated destroy.yml workflow (targeted apply for just this module)
+    try:
+        workflow = repo.get_workflow("destroy.yml")
+        workflow.create_dispatch(
+            ref=base_branch,
+            inputs={"project": env_dir, "module": resource_type},
+        )
+        logger.info("Triggered destroy.yml workflow for %s/%s", env_dir, resource_type)
+    except GithubException as e:
+        logger.warning("Could not trigger destroy workflow: %s", e)
+
     return {"commit_sha": commit_sha, "resource_type": resource_type, "resource_name": resource_name}
 
 

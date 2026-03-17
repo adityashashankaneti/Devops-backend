@@ -254,11 +254,12 @@ def _handle_destroy(event):
     region        = payload.get("region", "us-east-1").strip()
     resource_type = payload.get("resource_type", "").strip()
     resource_name = payload.get("resource_name", "").strip()
+    env_dir       = payload.get("env_dir", "dev").strip() or "dev"
 
     if not all([project, resource_type, resource_name]):
         return _response(400, {"error": "Missing required fields: project, resource_type, resource_name"})
 
-    logger.info("Destroy request: project=%s type=%s name=%s", project, resource_type, resource_name)
+    logger.info("Destroy request: project=%s env=%s type=%s name=%s", project, env_dir, resource_type, resource_name)
 
     try:
         github_token = get_secret(
@@ -274,6 +275,7 @@ def _handle_destroy(event):
             resource_type=resource_type,
             resource_name=resource_name,
             commit_message=f"destroy: remove {resource_type}/{resource_name} from {project}",
+            env_dir=env_dir,
         )
         return _response(200, {"status": "ok", **result})
 
