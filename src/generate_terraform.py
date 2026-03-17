@@ -416,6 +416,114 @@ def generate_resource_yamls(
     return resource_map
 
 
+# ── Destroy analysis ────────────────────────────────────────────────────────
+
+DESTROY_SYSTEM_PROMPT = """\
+You are an expert AWS infrastructure engineer.  You receive a complete set of
+deployed Terraform resource configs (YAML) and a request to DESTROY a specific
+resource.  Your job is to figure out what needs to change across ALL modules
+to safely remove that resource without leaving dangling references.
+
+AWS dependency rules you MUST follow:
+- An Internet Gateway CANNOT be deleted while route tables have routes pointing to it.
+- A NAT Gateway CANNOT be deleted while route tables have routes pointing to it.
+- A VPC CANNOT be deleted while it has subnets, internet gateways, NAT gateways,
+  security groups (non-default), or route tables attached.
+- A Subnet CANNOT be deleted while EC2 instances, NAT gateways, RDS instances,
+  or ALBs are using it.
+- A Security Group CANNOT be deleted while EC2 instances, RDS, ALB, Lambda, ECS,
+  or ElastiCache reference it.
+
+For each module type affected, return the COMPLETE resources.yaml content that
+should remain AFTER the destroy.  If a module should have no resources left,
+return an empty object {}.
+
+Return a JSON object:
+{
+  "modules_to_update": {
+    "<module-type>": { <remaining resources after removal> },
+    ...
+  },
+  "destroy_order": ["module-type-1", "module-type-2", ...],
+  "explanation": "brief explanation of what will be destroyed and why"
+}
+
+IMPORTANT:
+- Only include module types that NEED changes.  Don't include modules unaffected by the destroy.
+- The "destroy_order" lists modules that should run apply, in dependency order.
+- Respond with ONLY JSON.  No markdown fences, no extra text.
+"""
+
+
+def analyze_destroy(
+    resource_type: str,
+    resource_name: str,
+    all_resources: dict[str, dict],
+    anthropic_api_key: str,
+    model: str = "claude-opus-4-6",
+) -> dict:
+    """
+    Ask Claude to analyze what needs to change to safely destroy a resource.
+
+    Args:
+        resource_type: Module type (e.g. "internet-gateway")
+        resource_name: Resource name (e.g. "spoke-vpc-igw")
+        all_resources: { module_type: { resource_name: config } } — all deployed resources
+        anthropic_api_key: API key
+        model: Claude model to use
+
+    Returns:
+        {
+            "modules_to_update": { module_type: { remaining resources } },
+            "destroy_order": [module_type, ...],
+            "explanation": "..."
+        }
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    user_prompt = f"""\
+I want to DESTROY the resource "{resource_name}" from the "{resource_type}" module.
+
+Here are ALL currently deployed resources across all modules:
+{json.dumps(all_resources, indent=2)}
+
+Analyze the dependencies and return the updated resources.yaml content for
+every module that needs to change to safely remove "{resource_name}".
+Include the target module ("{resource_type}") and any modules that reference it."""
+
+    logger.info("Asking Claude to analyze destroy: %s/%s", resource_type, resource_name)
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=DESTROY_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    response_text = message.content[0].text.strip()
+
+    if response_text.startswith("```"):
+        lines = response_text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        response_text = "\n".join(lines)
+
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError as e:
+        logger.error("Claude destroy analysis returned invalid JSON: %s", response_text[:500])
+        raise ValueError(f"Failed to parse Claude destroy response: {e}")
+
+    logger.info(
+        "Destroy analysis: %d modules affected, order=%s, explanation=%s",
+        len(result.get("modules_to_update", {})),
+        result.get("destroy_order", []),
+        result.get("explanation", "")[:200],
+    )
+    return result
+
+
 # ── Terragrunt HCL templates ────────────────────────────────────────────────
 # Dependencies each module type needs from other modules' outputs.
 

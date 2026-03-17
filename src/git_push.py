@@ -218,6 +218,38 @@ def push_to_infra_repo(
     }
 
 
+def get_all_resources(
+    github_token: str,
+    repo_name: str,
+    env_dir: str = "dev",
+    base_branch: str = "main",
+) -> dict[str, dict]:
+    """Read all resources.yaml files from the repo. Returns { module_type: { name: config } }."""
+    g = Github(github_token)
+    repo = g.get_repo(repo_name)
+
+    all_res = {}
+    env_prefix = f"environments/{env_dir}"
+    try:
+        contents = repo.get_contents(env_prefix, ref=base_branch)
+    except GithubException:
+        return all_res
+
+    for item in contents:
+        if item.type != "dir":
+            continue
+        yaml_path = f"{env_prefix}/{item.name}/resources.yaml"
+        content = _get_file_content(repo, yaml_path, base_branch)
+        if content:
+            try:
+                data = yaml.safe_load(content) or {}
+                if data and isinstance(data, dict):
+                    all_res[item.name] = data
+            except yaml.YAMLError:
+                pass
+    return all_res
+
+
 def push_destroy_to_main(
     github_token: str,
     repo_name: str,
@@ -225,70 +257,95 @@ def push_destroy_to_main(
     resource_type: str,
     resource_name: str,
     commit_message: str,
+    modules_to_update: dict[str, dict] | None = None,
+    destroy_order: list[str] | None = None,
     env_dir: str = "dev",
     base_branch: str = "main",
 ) -> dict:
     """
-    Remove a named resource from resources.yaml and commit directly to main.
-    Commit message starts with 'destroy:' so the regular apply workflow skips it.
-    The destroy.yml workflow_dispatch is then triggered separately.
+    Apply Claude's destroy analysis: update multiple resources.yaml files in
+    one commit, then trigger run-all apply for affected modules.
 
-    Returns: { commit_sha, resource_type, resource_name }
+    Args:
+        modules_to_update: { module_type: { remaining resources } } from Claude
+        destroy_order: list of module types in dependency order
+    Returns: { commit_sha, resource_type, resource_name, modules_affected }
     """
     g = Github(github_token)
     repo = g.get_repo(repo_name)
 
-    yaml_path = f"environments/{env_dir}/{resource_type}/resources.yaml"
-
-    # Read current file
-    try:
-        file_obj = repo.get_contents(yaml_path, ref=base_branch)
-        current_content = file_obj.decoded_content.decode("utf-8")
-        file_sha = file_obj.sha
-    except GithubException as e:
-        raise ValueError(f"Could not read {yaml_path}: {e}") from e
-
-    # Parse, remove the resource, write back
-    try:
-        data = yaml.safe_load(current_content) or {}
-    except yaml.YAMLError:
-        data = {}
-
-    if resource_name not in data:
-        raise ValueError(
-            f"Resource '{resource_name}' not found in {yaml_path}. "
-            "It may have already been destroyed."
-        )
-
-    del data[resource_name]
-    new_content = yaml.dump(data, default_flow_style=False, sort_keys=False) if data else "{}\n"
-
-    # Ensure commit message starts with 'destroy:' so terraform.yml apply job is skipped
     if not commit_message.startswith("destroy:"):
         commit_message = f"destroy: {commit_message}"
 
-    result = repo.update_file(
-        path=yaml_path,
-        message=commit_message,
-        content=new_content,
-        sha=file_sha,
-        branch=base_branch,
-    )
-    commit_sha = result["commit"].sha
-    logger.info("Destroy commit %s: removed %s/%s", commit_sha[:8], resource_type, resource_name)
+    # If Claude provided multi-module analysis, update all affected files
+    if modules_to_update:
+        files_updated = []
+        for mod_type, remaining_resources in modules_to_update.items():
+            yaml_path = f"environments/{env_dir}/{mod_type}/resources.yaml"
+            new_content = (
+                yaml.dump(remaining_resources, default_flow_style=False, sort_keys=False)
+                if remaining_resources
+                else "{}\n"
+            )
+            sha = _get_file_sha(repo, yaml_path, base_branch)
+            if sha:
+                repo.update_file(yaml_path, commit_message, new_content, sha, branch=base_branch)
+                logger.info("Updated: %s", yaml_path)
+            else:
+                repo.create_file(yaml_path, commit_message, new_content, branch=base_branch)
+                logger.info("Created: %s", yaml_path)
+            files_updated.append(yaml_path)
 
-    # Trigger the dedicated destroy.yml workflow (targeted apply for just this module)
+        # Get the latest commit SHA after all updates
+        branch_ref = repo.get_branch(base_branch)
+        commit_sha = branch_ref.commit.sha
+    else:
+        # Fallback: single-module remove (old behavior)
+        yaml_path = f"environments/{env_dir}/{resource_type}/resources.yaml"
+        try:
+            file_obj = repo.get_contents(yaml_path, ref=base_branch)
+            current_content = file_obj.decoded_content.decode("utf-8")
+            file_sha = file_obj.sha
+        except GithubException as e:
+            raise ValueError(f"Could not read {yaml_path}: {e}") from e
+
+        try:
+            data = yaml.safe_load(current_content) or {}
+        except yaml.YAMLError:
+            data = {}
+
+        if resource_name not in data:
+            raise ValueError(
+                f"Resource '{resource_name}' not found in {yaml_path}. "
+                "It may have already been destroyed."
+            )
+        del data[resource_name]
+        new_content = yaml.dump(data, default_flow_style=False, sort_keys=False) if data else "{}\n"
+
+        result = repo.update_file(yaml_path, commit_message, new_content, file_sha, branch=base_branch)
+        commit_sha = result["commit"].sha
+        files_updated = [yaml_path]
+        destroy_order = [resource_type]
+
+    logger.info("Destroy commit %s: removed %s/%s (%d files)", commit_sha[:8], resource_type, resource_name, len(files_updated))
+
+    # Trigger destroy.yml with run-all apply for the whole project
     try:
         workflow = repo.get_workflow("destroy.yml")
         workflow.create_dispatch(
             ref=base_branch,
-            inputs={"project": env_dir, "module": resource_type},
+            inputs={"project": env_dir},
         )
-        logger.info("Triggered destroy.yml workflow for %s/%s", env_dir, resource_type)
+        logger.info("Triggered destroy.yml workflow for %s", env_dir)
     except GithubException as e:
         logger.warning("Could not trigger destroy workflow: %s", e)
 
-    return {"commit_sha": commit_sha, "resource_type": resource_type, "resource_name": resource_name}
+    return {
+        "commit_sha": commit_sha,
+        "resource_type": resource_type,
+        "resource_name": resource_name,
+        "modules_affected": destroy_order or [resource_type],
+    }
 
 
 def get_commit_status(github_token: str, repo_name: str, commit_sha: str) -> dict:

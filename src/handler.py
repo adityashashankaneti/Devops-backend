@@ -22,8 +22,9 @@ from generate_terraform import (
     build_terragrunt_hcl,
     build_project_yaml,
     resources_to_yaml,
+    analyze_destroy,
 )
-from git_push import push_to_infra_repo, get_pr_status, push_destroy_to_main, get_commit_status
+from git_push import push_to_infra_repo, get_pr_status, push_destroy_to_main, get_commit_status, get_all_resources
 from import_state import import_from_state
 from secrets_helper import get_secret
 
@@ -268,6 +269,36 @@ def _handle_destroy(event):
         )
         repo_name = os.environ.get("GITHUB_REPO", "your-org/devops-infra-live")
 
+        # Step 1: Read all deployed resources from the repo
+        all_resources = get_all_resources(
+            github_token=github_token,
+            repo_name=repo_name,
+            env_dir=env_dir,
+        )
+
+        # Step 2: Ask Claude to analyze dependencies and figure out
+        # what needs to change to safely destroy this resource
+        anthropic_key = get_secret(
+            os.environ.get("ANTHROPIC_API_KEY_SECRET_ARN", ""),
+            fallback_env="ANTHROPIC_API_KEY",
+        )
+        destroy_plan = analyze_destroy(
+            resource_type=resource_type,
+            resource_name=resource_name,
+            all_resources=all_resources,
+            anthropic_api_key=anthropic_key,
+        )
+
+        modules_to_update = destroy_plan.get("modules_to_update", {})
+        destroy_order = destroy_plan.get("destroy_order", [resource_type])
+
+        logger.info(
+            "Destroy plan: %d modules affected: %s — %s",
+            len(modules_to_update), list(modules_to_update.keys()),
+            destroy_plan.get("explanation", ""),
+        )
+
+        # Step 3: Push all changes to main and trigger destroy workflow
         result = push_destroy_to_main(
             github_token=github_token,
             repo_name=repo_name,
@@ -275,9 +306,15 @@ def _handle_destroy(event):
             resource_type=resource_type,
             resource_name=resource_name,
             commit_message=f"destroy: remove {resource_type}/{resource_name} from {project}",
+            modules_to_update=modules_to_update,
+            destroy_order=destroy_order,
             env_dir=env_dir,
         )
-        return _response(200, {"status": "ok", **result})
+        return _response(200, {
+            "status": "ok",
+            "explanation": destroy_plan.get("explanation", ""),
+            **result,
+        })
 
     except ValueError as e:
         return _response(404, {"error": str(e)})
