@@ -101,7 +101,7 @@ def _handle_chat(event):
         client = anthropic.Anthropic(api_key=anthropic_key)
 
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-opus-4-6",
             max_tokens=2048,
             system=(
                 "You are a DevOps and AWS cloud architecture expert assistant. "
@@ -145,10 +145,10 @@ def _handle_deploy(event):
     resources = payload.get("resources", [])
     connections = payload.get("connections", [])
 
-    ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
-    model = payload.get("model", "claude-sonnet-4-6")
+    ALLOWED_MODELS = {"claude-opus-4-6"}
+    model = payload.get("model", "claude-opus-4-6")
     if model not in ALLOWED_MODELS:
-        model = "claude-sonnet-4-6"
+        model = "claude-opus-4-6"
 
     logger.info(
         "Deploy request: project=%s region=%s resources=%d connections=%d model=%s",

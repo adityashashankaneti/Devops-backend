@@ -359,7 +359,7 @@ Return ONLY a JSON object: {{ "module_type": {{ "resource-name": {{ config }} }}
 def generate_resource_yamls(
     payload: dict,
     anthropic_api_key: str,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-opus-4-6",
 ) -> dict[str, dict]:
     """
     Call Claude to classify canvas resources into per-module-type YAML configs.
