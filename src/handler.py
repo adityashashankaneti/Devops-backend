@@ -256,11 +256,14 @@ def _handle_destroy(event):
     resource_type = payload.get("resource_type", "").strip()
     resource_name = payload.get("resource_name", "").strip()
     env_dir       = payload.get("env_dir", "dev").strip() or "dev"
+    # Frontend sends list of all deployed resources for dependency analysis
+    frontend_deployed = payload.get("deployed_resources", [])
 
     if not all([project, resource_type, resource_name]):
         return _response(400, {"error": "Missing required fields: project, resource_type, resource_name"})
 
-    logger.info("Destroy request: project=%s env=%s type=%s name=%s", project, env_dir, resource_type, resource_name)
+    logger.info("Destroy request: project=%s env=%s type=%s name=%s deployed_count=%d",
+                project, env_dir, resource_type, resource_name, len(frontend_deployed))
 
     try:
         github_token = get_secret(
@@ -287,7 +290,15 @@ def _handle_destroy(event):
             resource_name=resource_name,
             all_resources=all_resources,
             anthropic_api_key=anthropic_key,
+            frontend_deployed=frontend_deployed,
         )
+
+        # If Claude says there's a blocking dependency, return 409 so frontend shows it
+        if destroy_plan.get("blocked"):
+            return _response(409, {
+                "dependency_error": True,
+                "explanation": destroy_plan.get("explanation", "Cannot destroy — dependencies exist."),
+            })
 
         modules_to_update = destroy_plan.get("modules_to_update", {})
         destroy_order = destroy_plan.get("destroy_order", [resource_type])

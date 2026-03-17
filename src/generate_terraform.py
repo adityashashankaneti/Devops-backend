@@ -426,6 +426,8 @@ to safely remove that resource without leaving dangling references.
 
 AWS dependency rules you MUST follow:
 - An Internet Gateway CANNOT be deleted while route tables have routes pointing to it.
+- An Internet Gateway CANNOT be detached from a VPC while NAT Gateways exist
+  that use public IPs (NAT gateways hold Elastic IPs that go through the IGW).
 - A NAT Gateway CANNOT be deleted while route tables have routes pointing to it.
 - A VPC CANNOT be deleted while it has subnets, internet gateways, NAT gateways,
   security groups (non-default), or route tables attached.
@@ -434,12 +436,27 @@ AWS dependency rules you MUST follow:
 - A Security Group CANNOT be deleted while EC2 instances, RDS, ALB, Lambda, ECS,
   or ElastiCache reference it.
 
-For each module type affected, return the COMPLETE resources.yaml content that
-should remain AFTER the destroy.  If a module should have no resources left,
-return an empty object {}.
+CRITICAL: If the user asks to destroy a resource but other deployed resources
+DEPEND on it and those dependents are still deployed, you MUST return a BLOCKED
+response telling the user which resources to delete first.
 
-Return a JSON object:
+For example:
+- User wants to destroy an Internet Gateway, but a NAT Gateway still exists
+  → BLOCKED: "Delete the NAT Gateway 'spoke-vpc-nat-gw' first"
+- User wants to destroy a VPC, but subnets and IGW still exist
+  → BLOCKED: "Delete subnets, internet gateway, and NAT gateway first"
+
+When BLOCKED, return:
 {
+  "blocked": true,
+  "explanation": "Cannot destroy <resource>. You must first delete:\n- <resource-type>/<resource-name> (reason)\n- ...",
+  "modules_to_update": {},
+  "destroy_order": []
+}
+
+When NOT blocked (safe to destroy), return:
+{
+  "blocked": false,
   "modules_to_update": {
     "<module-type>": { <remaining resources after removal> },
     ...
@@ -461,6 +478,7 @@ def analyze_destroy(
     all_resources: dict[str, dict],
     anthropic_api_key: str,
     model: str = "claude-opus-4-6",
+    frontend_deployed: list[dict] | None = None,
 ) -> dict:
     """
     Ask Claude to analyze what needs to change to safely destroy a resource.
@@ -471,9 +489,11 @@ def analyze_destroy(
         all_resources: { module_type: { resource_name: config } } — all deployed resources
         anthropic_api_key: API key
         model: Claude model to use
+        frontend_deployed: list of { resource_type, resource_name } from frontend canvas
 
     Returns:
         {
+            "blocked": bool,
             "modules_to_update": { module_type: { remaining resources } },
             "destroy_order": [module_type, ...],
             "explanation": "..."
@@ -483,14 +503,27 @@ def analyze_destroy(
 
     client = anthropic.Anthropic(api_key=anthropic_api_key)
 
+    # Build context about what the frontend knows is deployed
+    frontend_context = ""
+    if frontend_deployed:
+        frontend_context = (
+            "\n\nThe user's canvas shows these deployed (green/live) resources:\n"
+            + json.dumps(frontend_deployed, indent=2)
+            + "\n\nUse this to cross-check which resources are still live."
+        )
+
     user_prompt = f"""\
 I want to DESTROY the resource "{resource_name}" from the "{resource_type}" module.
 
-Here are ALL currently deployed resources across all modules:
-{json.dumps(all_resources, indent=2)}
+Here are ALL currently deployed resources across all modules (from the Terraform repo):
+{json.dumps(all_resources, indent=2)}{frontend_context}
 
-Analyze the dependencies and return the updated resources.yaml content for
-every module that needs to change to safely remove "{resource_name}".
+Analyze the dependencies. If other deployed resources depend on "{resource_name}"
+and would break or block the destroy, return a BLOCKED response telling the user
+exactly which resources to delete first and why.
+
+If safe to proceed, return the updated resources.yaml content for every module
+that needs to change to safely remove "{resource_name}".
 Include the target module ("{resource_type}") and any modules that reference it."""
 
     logger.info("Asking Claude to analyze destroy: %s/%s", resource_type, resource_name)
