@@ -466,6 +466,12 @@ When NOT blocked (safe to destroy), return:
 }
 
 IMPORTANT:
+- ONLY remove the exact resource the user asked to destroy.  Do NOT cascade-remove
+  supporting resources (security groups, subnets, route tables, etc.) that the
+  target resource references.  Those supporting resources may be shared and their
+  modules run BEFORE the target module during apply, causing ordering failures.
+  For example: if the user destroys an EC2 instance, remove it from the ec2 module
+  but do NOT also remove its security group from the security-group module.
 - Only include module types that NEED changes.  Don't include modules unaffected by the destroy.
 - The "destroy_order" lists modules that should run apply, in dependency order.
 - Respond with ONLY JSON.  No markdown fences, no extra text.
