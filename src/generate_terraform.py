@@ -477,7 +477,7 @@ def analyze_destroy(
     resource_name: str,
     all_resources: dict[str, dict],
     anthropic_api_key: str,
-    model: str = "claude-opus-4-6",
+    model: str = "claude-sonnet-4-6",
     frontend_deployed: list[dict] | None = None,
 ) -> dict:
     """
