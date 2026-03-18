@@ -419,37 +419,44 @@ def generate_resource_yamls(
 # ── Destroy analysis ────────────────────────────────────────────────────────
 
 DESTROY_SYSTEM_PROMPT = """\
-You are an expert AWS infrastructure engineer.  You receive a complete set of
-deployed Terraform resource configs (YAML) and a request to DESTROY a specific
-resource.  Your job is to figure out what needs to change across ALL modules
-to safely remove that resource without leaving dangling references.
+You are an expert AWS infrastructure engineer.  You receive:
+1. ALL currently deployed resource configs (YAML) — the "green" / live resources.
+2. The actual Terraform module code (.tf files) that manages these resources.
+3. A request to DESTROY a specific resource.
 
-AWS dependency rules you MUST follow:
-- An Internet Gateway CANNOT be deleted while route tables have routes pointing to it.
-- An Internet Gateway CANNOT be detached from a VPC while NAT Gateways exist
-  that use public IPs (NAT gateways hold Elastic IPs that go through the IGW).
-- A NAT Gateway CANNOT be deleted while route tables have routes pointing to it.
-- A VPC CANNOT be deleted while it has subnets, internet gateways, NAT gateways,
-  security groups (non-default), or route tables attached.
-- A Subnet CANNOT be deleted while EC2 instances, NAT gateways, RDS instances,
-  or ALBs are using it.
-- A Security Group CANNOT be deleted while EC2 instances, RDS, ALB, Lambda, ECS,
-  or ElastiCache reference it.
+Your job: read the Terraform code to understand the REAL dependency graph,
+then figure out what needs to change across ALL modules to safely remove that
+resource without leaving dangling references.
 
-CRITICAL: If the user asks to destroy a resource but other deployed resources
-DEPEND on it and those dependents are still deployed, you MUST return a BLOCKED
-response telling the user which resources to delete first.
+UNDERSTANDING DEPENDENCIES FROM THE TERRAFORM CODE:
+- Read each module's main.tf to see how resources reference each other via
+  `lookup(var.xxx_ids, each.value.xxx_name, null)` patterns.
+- These cross-references tell you the real dependency chain.
+- For example, if route-table/main.tf does
+  `nat_gateway_id = lookup(var.nat_gateway_ids, ...)` and a route table config
+  has `gateway_name: "my-nat-gw"`, then that route table DEPENDS on that NAT GW.
 
-For example:
-- User wants to destroy an Internet Gateway, but a NAT Gateway still exists
-  → BLOCKED: "Delete the NAT Gateway 'spoke-vpc-nat-gw' first"
-- User wants to destroy a VPC, but subnets and IGW still exist
-  → BLOCKED: "Delete subnets, internet gateway, and NAT gateway first"
+UNDERSTANDING TERRAGRUNT APPLY ORDER:
+- `terragrunt run-all apply` runs modules in CREATION order (dependencies first).
+- This means parent modules (vpc, subnet, security-group) run BEFORE child
+  modules (ec2, nat-gateway, route-table).
+- When you remove a resource from resources.yaml and run apply, Terraform
+  destroys it. But if a PARENT module tries to destroy a resource that a CHILD
+  module still references, AWS will BLOCK the delete (timeout for ~10 minutes).
+- Therefore: ONLY remove the exact resource the user asked to destroy from its
+  own module. Do NOT cascade-remove supporting resources from parent modules.
+  For example: destroying an EC2 → only update ec2/resources.yaml.
+  Do NOT also remove its security group from security-group/resources.yaml.
+
+BLOCKING RULES:
+If the user asks to destroy a resource but other deployed resources DEPEND on it
+(checked by reading the Terraform code and config YAML), you MUST return a
+BLOCKED response telling the user which resources to delete first.
 
 When BLOCKED, return:
 {
   "blocked": true,
-  "explanation": "Cannot destroy <resource>. You must first delete:\n- <resource-type>/<resource-name> (reason)\n- ...",
+  "explanation": "Cannot destroy <resource>. You must first delete:\\n- <resource-type>/<resource-name> (reason)\\n- ...",
   "modules_to_update": {},
   "destroy_order": []
 }
@@ -468,12 +475,10 @@ When NOT blocked (safe to destroy), return:
 IMPORTANT:
 - ONLY remove the exact resource the user asked to destroy.  Do NOT cascade-remove
   supporting resources (security groups, subnets, route tables, etc.) that the
-  target resource references.  Those supporting resources may be shared and their
-  modules run BEFORE the target module during apply, causing ordering failures.
-  For example: if the user destroys an EC2 instance, remove it from the ec2 module
-  but do NOT also remove its security group from the security-group module.
-- Only include module types that NEED changes.  Don't include modules unaffected by the destroy.
-- The "destroy_order" lists modules that should run apply, in dependency order.
+  target resource references.  Parent modules run BEFORE child modules during
+  apply, so cascade-removing causes ordering failures (10+ minute hangs).
+- Only include module types that NEED changes.
+- The "destroy_order" lists modules in the order they should be applied.
 - Respond with ONLY JSON.  No markdown fences, no extra text.
 """
 
@@ -483,8 +488,9 @@ def analyze_destroy(
     resource_name: str,
     all_resources: dict[str, dict],
     anthropic_api_key: str,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-opus-4-6",
     frontend_deployed: list[dict] | None = None,
+    terraform_code: dict[str, dict[str, str]] | None = None,
 ) -> dict:
     """
     Ask Claude to analyze what needs to change to safely destroy a resource.
@@ -496,6 +502,7 @@ def analyze_destroy(
         anthropic_api_key: API key
         model: Claude model to use
         frontend_deployed: list of { resource_type, resource_name } from frontend canvas
+        terraform_code: { module_type: { "main.tf": "...", ... } } — actual TF code
 
     Returns:
         {
@@ -518,21 +525,32 @@ def analyze_destroy(
             + "\n\nUse this to cross-check which resources are still live."
         )
 
+    # Build Terraform code section
+    tf_code_section = ""
+    if terraform_code:
+        tf_code_section = "\n\n═══ TERRAFORM MODULE CODE (.tf files) ═══\n"
+        for mod_type, files in terraform_code.items():
+            tf_code_section += f"\n── Module: {mod_type} ──\n"
+            for filename, content in files.items():
+                tf_code_section += f"\n### {filename}\n```hcl\n{content}\n```\n"
+
     user_prompt = f"""\
 I want to DESTROY the resource "{resource_name}" from the "{resource_type}" module.
 
-Here are ALL currently deployed resources across all modules (from the Terraform repo):
+═══ ALL CURRENTLY DEPLOYED RESOURCES (green/live) ═══
 {json.dumps(all_resources, indent=2)}{frontend_context}
+{tf_code_section}
+Read the Terraform code above to understand the real dependency graph between
+modules.  Then analyze whether it is safe to destroy "{resource_type}/{resource_name}".
 
-Analyze the dependencies. If other deployed resources depend on "{resource_name}"
-and would break or block the destroy, return a BLOCKED response telling the user
-exactly which resources to delete first and why.
+If other deployed resources depend on "{resource_name}" and would break or block
+the destroy, return a BLOCKED response telling the user exactly which resources
+to delete first and why.
 
-If safe to proceed, return the updated resources.yaml content for every module
-that needs to change to safely remove "{resource_name}".
-Include the target module ("{resource_type}") and any modules that reference it."""
+If safe to proceed, return the updated resources.yaml content for ONLY the
+target module ("{resource_type}").  Do NOT cascade-remove from parent modules."""
 
-    logger.info("Asking Claude to analyze destroy: %s/%s", resource_type, resource_name)
+    logger.info("Asking Claude (%s) to analyze destroy: %s/%s", model, resource_type, resource_name)
 
     message = client.messages.create(
         model=model,

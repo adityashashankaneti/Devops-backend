@@ -24,7 +24,7 @@ from generate_terraform import (
     resources_to_yaml,
     analyze_destroy,
 )
-from git_push import push_to_infra_repo, get_pr_status, push_destroy_to_main, get_commit_status, get_all_resources
+from git_push import push_to_infra_repo, get_pr_status, push_destroy_to_main, get_commit_status, get_all_resources, get_module_terraform_code
 from import_state import import_from_state
 from secrets_helper import get_secret
 
@@ -279,6 +279,14 @@ def _handle_destroy(event):
             env_dir=env_dir,
         )
 
+        # Step 1b: Read the actual Terraform module code for all deployed module types
+        module_types = list(all_resources.keys())
+        terraform_code = get_module_terraform_code(
+            github_token=github_token,
+            repo_name=repo_name,
+            module_types=module_types,
+        )
+
         # Step 2: Ask Claude to analyze dependencies and figure out
         # what needs to change to safely destroy this resource
         anthropic_key = get_secret(
@@ -291,6 +299,7 @@ def _handle_destroy(event):
             all_resources=all_resources,
             anthropic_api_key=anthropic_key,
             frontend_deployed=frontend_deployed,
+            terraform_code=terraform_code,
         )
 
         # If Claude says there's a blocking dependency, return 409 so frontend shows it

@@ -258,6 +258,41 @@ def get_all_resources(
     return all_res
 
 
+def get_module_terraform_code(
+    github_token: str,
+    repo_name: str,
+    module_types: list[str],
+    base_branch: str = "main",
+) -> dict[str, dict[str, str]]:
+    """
+    Read the actual Terraform (.tf) files for each module type.
+
+    Returns: { module_type: { "main.tf": "...", "variables.tf": "...", ... } }
+    """
+    g = Github(github_token)
+    repo = g.get_repo(repo_name)
+
+    result = {}
+    for mod_type in module_types:
+        mod_dir = f"modules/{mod_type}"
+        try:
+            contents = repo.get_contents(mod_dir, ref=base_branch)
+        except GithubException:
+            continue
+
+        tf_files = {}
+        for item in contents:
+            if item.type == "file" and item.name.endswith(".tf"):
+                content = _get_file_content(repo, item.path, base_branch)
+                if content:
+                    tf_files[item.name] = content
+
+        if tf_files:
+            result[mod_type] = tf_files
+
+    return result
+
+
 def push_destroy_to_main(
     github_token: str,
     repo_name: str,
