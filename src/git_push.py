@@ -157,16 +157,24 @@ def push_to_infra_repo(
     else:
         logger.info("Skipping project.yaml — already exists on %s", base_branch)
 
+    # Module types that are fully auto-generated from the canvas each deploy,
+    # so their resources.yaml should be replaced entirely (not merged).
+    REPLACE_MODULES = {"route-table"}
+
     # 2. For each resource type: only merge resources.yaml
     #    (terragrunt.hcl already exists as a static file in the repo)
     for module_type, resources in resource_map.items():
         type_dir = f"{env_prefix}/{module_type}"
 
-        # Merge resources.yaml (append new resources to existing)
         yaml_path = f"{type_dir}/resources.yaml"
-        existing_yaml = _get_file_content(repo, yaml_path, branch_name)
-        merged_yaml = _merge_yaml_resources(existing_yaml, resources)
-        _upsert_file(repo, yaml_path, merged_yaml, commit_message, branch_name)
+        if module_type in REPLACE_MODULES:
+            # Auto-generated modules: replace entirely to avoid stale duplicates
+            final_yaml = yaml.dump(resources, default_flow_style=False, sort_keys=False)
+        else:
+            # Normal modules: merge new resources into existing
+            existing_yaml = _get_file_content(repo, yaml_path, branch_name)
+            final_yaml = _merge_yaml_resources(existing_yaml, resources)
+        _upsert_file(repo, yaml_path, final_yaml, commit_message, branch_name)
         files_written.append(yaml_path)
 
     # Get latest commit SHA
