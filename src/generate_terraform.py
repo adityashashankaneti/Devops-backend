@@ -436,22 +436,41 @@ UNDERSTANDING DEPENDENCIES FROM THE TERRAFORM CODE:
   `nat_gateway_id = lookup(var.nat_gateway_ids, ...)` and a route table config
   has `gateway_name: "my-nat-gw"`, then that route table DEPENDS on that NAT GW.
 
-UNDERSTANDING TERRAGRUNT APPLY ORDER:
-- `terragrunt run-all apply` runs modules in CREATION order (dependencies first).
-- This means parent modules (vpc, subnet, security-group) run BEFORE child
-  modules (ec2, nat-gateway, route-table).
-- When you remove a resource from resources.yaml and run apply, Terraform
-  destroys it. But if a PARENT module tries to destroy a resource that a CHILD
-  module still references, AWS will BLOCK the delete (timeout for ~10 minutes).
-- Therefore: ONLY remove the exact resource the user asked to destroy from its
-  own module. Do NOT cascade-remove supporting resources from parent modules.
-  For example: destroying an EC2 → only update ec2/resources.yaml.
-  Do NOT also remove its security group from security-group/resources.yaml.
+UNDERSTANDING TERRAGRUNT APPLY ORDER (CRITICAL):
+`terragrunt run-all apply` runs modules in CREATION order (dependencies first):
+  Group 1: vpc, s3, dynamodb, sqs, sns, eventbridge, ecs, cloudfront
+  Group 2: subnet, internet-gateway, security-group, route53
+  Group 3: ec2, nat-gateway, rds, lambda, elasticache
+  Group 4: route-table, alb
 
-BLOCKING RULES:
-If the user asks to destroy a resource but other deployed resources DEPEND on it
-(checked by reading the Terraform code and config YAML), you MUST return a
-BLOCKED response telling the user which resources to delete first.
+This is the order for BOTH creates AND destroys.  When Terraform destroys a
+resource, its module runs in the same group position.  This means:
+- UPSTREAM modules (earlier groups) run BEFORE the target module.
+- DOWNSTREAM modules (later groups) run AFTER the target module.
+
+CASCADE RULES — upstream vs downstream:
+1. NEVER cascade-remove from UPSTREAM (earlier-group) modules.
+   These run BEFORE the target, so if you remove a resource from an upstream
+   module, Terraform tries to destroy it while the target still references it
+   → AWS blocks the delete for 10+ minutes.
+   Example: destroying EC2 (Group 3) → do NOT also remove its security group
+   from security-group (Group 2).
+
+2. ALWAYS cascade-clean DOWNSTREAM (later-group) modules that reference the
+   target resource.  These run AFTER the target, so it's safe — the target
+   is already gone by the time the downstream module applies.
+   Example: destroying nat-gateway (Group 3) → also remove any routes in
+   route-table (Group 4) that reference that NAT gateway.  Remove just the
+   route entry from the route table config, or remove the entire route table
+   if it has no other purpose.
+
+3. For modules in the SAME group as the target: treat as UPSTREAM (don't
+   cascade-remove) to be safe, since execution order within a group is
+   undefined.
+
+NEVER BLOCK when you can cascade-clean downstream instead.  Only BLOCK when
+the dependent resource is in an UPSTREAM or SAME group and cannot be cleaned
+from downstream.
 
 When BLOCKED, return:
 {
@@ -473,10 +492,12 @@ When NOT blocked (safe to destroy), return:
 }
 
 IMPORTANT:
-- ONLY remove the exact resource the user asked to destroy.  Do NOT cascade-remove
-  supporting resources (security groups, subnets, route tables, etc.) that the
-  target resource references.  Parent modules run BEFORE child modules during
-  apply, so cascade-removing causes ordering failures (10+ minute hangs).
+- Include the target module AND any downstream modules that need references
+  cleaned up in modules_to_update.
+- When cleaning a downstream module, only remove the specific references to
+  the destroyed resource.  For example, if a route table has 2 routes and only
+  one points to the destroyed NAT GW, remove that one route but keep the other.
+  If the route table has no remaining routes or associations, remove it entirely.
 - Only include module types that NEED changes.
 - The "destroy_order" lists modules in the order they should be applied.
 - Respond with ONLY JSON.  No markdown fences, no extra text.
